@@ -7,141 +7,227 @@
 )]
 
 extern crate alloc;
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use esp_demo::config;
+use esp_demo::raw_framebuffer;
 
+use core::ptr::addr_of_mut;
+
+use alloc::boxed::Box;
+use alloc::format;
+use bevy_ecs::prelude::*;
+use bevy_ecs::{schedule::Schedule, world::World};
+use config::{LCD_HEIGHT, LCD_WIDTH};
+use embassy_executor::Spawner;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embedded_graphics::draw_target::DrawTarget;
+use embedded_graphics::mono_font::ascii::FONT_8X13;
+use embedded_graphics::prelude::Size;
+use embedded_graphics::primitives::StyledDrawable;
+use embedded_graphics::Drawable;
+use embedded_graphics::{
+    mono_font::MonoTextStyle,
+    pixelcolor::Rgb565,
+    prelude::{Point, RgbColor},
+    primitives::Rectangle,
+    text::Text,
+};
+use embedded_hal::delay::DelayNs;
+use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::delay::Delay;
-use esp_hal::gpio::{Level, Output, OutputConfig};
-use esp_hal::rtc_cntl::Rtc;
-use esp_hal::spi::master::{Config, Spi};
-use esp_hal::timer::systimer::SystemTimer;
+use esp_hal::system::{CpuControl, Stack};
 use esp_hal::timer::timg::TimerGroup;
-use log::info;
-
-use embedded_hal_bus::spi::ExclusiveDevice;
-
-use embedded_graphics::{
-    pixelcolor::Rgb565,
-    prelude::*,
-    primitives::{Circle, Primitive, PrimitiveStyle, Triangle},
+use esp_hal::timer::AnyTimer;
+use esp_hal::{
+    delay::Delay,
+    dma::{DmaRxBuf, DmaTxBuf},
+    dma_buffers,
+    gpio::{Level, Output, OutputConfig},
+    spi::master::{Spi, SpiDmaBus},
+    time::Rate,
+    Blocking,
 };
+use esp_hal_embassy::Executor;
+use esp_println::logger::init_logger_from_env;
+use mipidsi::{interface::SpiInterface, models::ST7789, options::Orientation, Builder};
+use raw_framebuffer::RawFramebuffer;
+use static_cell::StaticCell;
 
-// Provides the parallel port and display interface builders
-use mipidsi::interface::SpiInterface;
+static mut APP_CORE_STACK: Stack<1024> = Stack::new();
 
-use mipidsi::options::ColorOrder;
-// Provides the Display builder
-use mipidsi::{models::ST7789, Builder};
+static MOSI: Channel<CriticalSectionRawMutex, &mut RawFramebuffer<Rgb565>, 2> = Channel::new();
+static MISO: Channel<CriticalSectionRawMutex, &mut RawFramebuffer<Rgb565>, 2> = Channel::new();
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
-esp_bootloader_esp_idf::esp_app_desc!();
+struct DisplayResource {
+    display: mipidsi::Display<
+        SpiInterface<
+            'static,
+            ExclusiveDevice<SpiDmaBus<'static, Blocking>, Output<'static>, Delay>,
+            Output<'static>,
+        >,
+        ST7789,
+        Output<'static>,
+    >,
+}
+
+#[embassy_executor::task]
+async fn run1(mut display_res: DisplayResource) {
+    let area = Rectangle::new(
+        Point::zero(),
+        Size {
+            width: config::LCD_WIDTH as u32,
+            height: config::LCD_HEIGHT as u32,
+        },
+    );
+    loop {
+        // Flush the framebuffer to the physical display.
+        let fb = MOSI.receive().await;
+        display_res
+            .display
+            .fill_contiguous(&area, fb.data.iter().copied())
+            .unwrap();
+        MISO.try_send(fb).expect("MISO send framebuffer error");
+    }
+}
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
-    // generator version: 0.5.0
+    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    esp_alloc::heap_allocator!(size: 158*1024);
+    init_logger_from_env();
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let timer0: AnyTimer = timg0.timer0.into();
+    let timer1: AnyTimer = timg0.timer1.into();
+    esp_hal_embassy::init([timer0, timer1]);
+    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+    log::info!("Embassy initialized!");
 
-    esp_println::logger::init_logger_from_env();
+    // --- DMA Buffers for SPI ---
+    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(1, 2048);
+    let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
+    let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
+    // --- Display Setup using BSP values ---
+    let spi = Spi::<Blocking>::new(
+        peripherals.SPI2,
+        esp_hal::spi::master::Config::default()
+            .with_frequency(Rate::from_mhz(40))
+            .with_mode(esp_hal::spi::Mode::_3),
+    )
+    .unwrap()
+    .with_sck(peripherals.GPIO18)
+    .with_mosi(peripherals.GPIO21)
+    .with_dma(peripherals.DMA_CH3)
+    .with_buffers(dma_rx_buf, dma_tx_buf);
+    let cs_output = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    let spi_delay = Delay::new();
+    let spi_device = ExclusiveDevice::new(spi, cs_output, spi_delay).unwrap();
 
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    // LCD interface
+    let lcd_dc = Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default());
+    // Leak a Box to obtain a 'static mutable buffer.
+    let buffer: &'static mut [u8; 2048] = Box::leak(Box::new([0_u8; 2048]));
+    let di = SpiInterface::new(spi_device, lcd_dc, buffer);
 
-    // Disable the RTC and TIMG watchdog timers
-    let mut rtc = Rtc::new(peripherals.LPWR);
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0);
-    let mut wdt0 = timer_group0.wdt;
-    let timer_group1 = TimerGroup::new(peripherals.TIMG1);
-    let mut wdt1 = timer_group1.wdt;
-    rtc.swd.disable();
-    rtc.rwdt.disable();
-    wdt0.disable();
-    wdt1.disable();
+    let mut display_delay = Delay::new();
+    display_delay.delay_ns(500_000u32);
 
-    // Init embassy
-    let timer0 = SystemTimer::new(peripherals.SYSTIMER);
-    esp_hal_embassy::init(timer0.alarm0);
+    // Reset pin: OpenDrain required for ESP32-S3-BOX! Tricky setting.
+    // For some Wrover-Kit boards the reset pin must be pulsed low.
+    let mut reset = Output::new(peripherals.GPIO17, Level::Low, OutputConfig::default());
+    // Pulse the reset pin: drive low for 100 ms then high.
+    reset.set_low();
+    Delay::new().delay_ms(100u32);
+    reset.set_high();
 
-    info!("Embassy initialized!");
-
-    // TODO: Spawn some tasks
-    let _ = spawner;
-
-    // Define the delay struct, needed for the display driver
-    let mut delay = Delay::new();
-
-    // Define the Data/Command select pin as a digital output
-    let dc = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
-    // Define the reset pin as digital outputs and make it high
-    let mut rst = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
-    rst.set_high();
-
-    // Define the SPI pins and create the SPI interface
-    let spi = Spi::new(peripherals.SPI2, Config::default())
-        .unwrap()
-        .with_sck(peripherals.GPIO0)
-        .with_mosi(peripherals.GPIO1)
-        .with_miso(peripherals.GPIO2);
-
-    let cs_output = Output::new(peripherals.GPIO3, Level::High, OutputConfig::default());
-    let spi_device = ExclusiveDevice::new_no_delay(spi, cs_output).unwrap();
-
-    let mut buffer = [0_u8; 512];
-
-    // Define the display interface with no chip select
-    let di = SpiInterface::new(spi_device, dc, &mut buffer);
-
-    // Define the display from the display interface and initialize it
-    let mut display = Builder::new(ST7789, di)
-        .reset_pin(rst)
-        .init(&mut delay)
+    // Initialize the display using mipidsi's builder.
+    let mut display = Builder::new(config::MODEL, di)
+        .reset_pin(reset)
+        .color_order(mipidsi::options::ColorOrder::Bgr)
+        .orientation(Orientation::default().rotate(config::ROTATION))
+        .init(&mut display_delay)
         .unwrap();
 
-    // Make the display all black
     display.clear(Rgb565::BLACK).unwrap();
 
-    // Draw a smiley face with white eyes and a red mouth
-    draw_smiley(&mut display).unwrap();
+    let mut world = World::default();
+    let mut schedule = Schedule::default();
+    schedule.add_systems(render_system);
 
+    log::info!("data0");
+    let data0 = Box::new([Rgb565::BLACK; config::LCD_BUFFER_SIZE]);
+    log::info!("fb0");
+    let fb0 = Box::leak(Box::new(RawFramebuffer::new(
+        Box::leak(data0),
+        LCD_WIDTH as u32,
+        LCD_HEIGHT as u32,
+    )));
+    log::info!("data1");
+    let data1 = Box::new([Rgb565::BLACK; config::LCD_BUFFER_SIZE]);
+    let fb1 = Box::leak(Box::new(RawFramebuffer::new(
+        Box::leak(data1),
+        LCD_WIDTH as u32,
+        LCD_HEIGHT as u32,
+    )));
+
+    log::info!("MOSI");
+    MOSI.send(fb0).await;
+    MOSI.send(fb1).await;
+
+    log::info!("spawner");
+    // let r: embassy_sync::channel::Receiver<
+    //     '_,
+    //     CriticalSectionRawMutex,
+    //     &mut RawFramebuffer<'_, Rgb565>,
+    //     2,
+    // > = mosi.receiver();
+
+    let _guard = cpu_control
+        .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, move || {
+            static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+            let executor = EXECUTOR.init(Executor::new());
+            executor.run(|spawner| {
+                spawner.spawn(run1(DisplayResource { display })).ok();
+            });
+        })
+        .unwrap();
+
+    let _spawner = spawner;
+    log::info!("schedule");
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        schedule.run(&mut world);
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.0/examples/src/bin
 }
 
-fn draw_smiley<T: DrawTarget<Color = Rgb565>>(display: &mut T) -> Result<(), T::Error> {
-    // Draw the left eye as a circle located at (50, 100), with a diameter of 40, filled with white
-    Circle::new(Point::new(50, 100), 40)
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-        .draw(display)?;
+fn render_system(mut prev_time: Local<u64>, mut prev_update_time: Local<u64>) {
+    let time = embassy_time::Instant::now().as_millis();
+    let delta = time - *prev_update_time;
+    let fps = if delta == 0 { 0 } else { 1000 / delta };
+    let sps = time - *prev_time;
+    *prev_time = time;
 
-    // Draw the right eye as a circle located at (50, 200), with a diameter of 40, filled with white
-    Circle::new(Point::new(50, 200), 40)
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-        .draw(display)?;
+    let Ok(fb) = MISO.try_receive() else {
+        return;
+    };
+    *prev_update_time = time;
 
-    // Draw an upside down red triangle to represent a smiling mouth
-    Triangle::new(
-        Point::new(130, 140),
-        Point::new(130, 200),
-        Point::new(160, 170),
+    // Clear the framebuffer.
+    fb.clear(Rgb565::BLUE).unwrap();
+
+    Rectangle::new(Point::new(10, 10), Size::new(200, 156))
+        .draw_styled(
+            &embedded_graphics::primitives::PrimitiveStyle::with_fill(Rgb565::BLACK),
+            fb,
+        )
+        .unwrap();
+    Text::new(
+        &format!("FPS:{}, sps:{}", fps, sps),
+        Point::new(20, 20),
+        MonoTextStyle::new(&FONT_8X13, Rgb565::WHITE),
     )
-    .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-    .draw(display)?;
+    .draw(fb)
+    .unwrap();
 
-    // Cover the top part of the mouth with a black triangle so it looks closed instead of open
-    Triangle::new(
-        Point::new(130, 150),
-        Point::new(130, 190),
-        Point::new(150, 170),
-    )
-    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-    .draw(display)?;
-
-    Ok(())
+    MOSI.try_send(fb).expect("MOSI send framebuffer error");
 }
