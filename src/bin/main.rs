@@ -116,16 +116,16 @@ async fn main(spawner: Spawner) {
             .with_mode(esp_hal::spi::Mode::_3),
     )
     .unwrap()
-    .with_sck(peripherals.GPIO18)
-    .with_mosi(peripherals.GPIO21)
+    .with_sck(peripherals.GPIO2)
+    .with_mosi(peripherals.GPIO3)
     .with_dma(peripherals.DMA_CH3)
     .with_buffers(dma_rx_buf, dma_tx_buf);
-    let cs_output = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    let cs_output = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
     let spi_delay = Delay::new();
     let spi_device = ExclusiveDevice::new(spi, cs_output, spi_delay).unwrap();
 
     // LCD interface
-    let lcd_dc = Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default());
+    let lcd_dc = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
     // Leak a Box to obtain a 'static mutable buffer.
     let buffer: &'static mut [u8; 2048] = Box::leak(Box::new([0_u8; 2048]));
     let di = SpiInterface::new(spi_device, lcd_dc, buffer);
@@ -135,7 +135,7 @@ async fn main(spawner: Spawner) {
 
     // Reset pin: OpenDrain required for ESP32-S3-BOX! Tricky setting.
     // For some Wrover-Kit boards the reset pin must be pulsed low.
-    let mut reset = Output::new(peripherals.GPIO17, Level::Low, OutputConfig::default());
+    let mut reset = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
     // Pulse the reset pin: drive low for 100 ms then high.
     reset.set_low();
     Delay::new().delay_ms(100u32);
