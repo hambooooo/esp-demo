@@ -110,7 +110,7 @@ async fn main(spawner: Spawner) {
 
     // --- Display Setup using BSP values ---
     let spi = Spi::<Blocking>::new(
-        peripherals.SPI2,
+        peripherals.SPI3,
         esp_hal::spi::master::Config::default()
             .with_frequency(Rate::from_mhz(40))
             .with_mode(esp_hal::spi::Mode::_3),
