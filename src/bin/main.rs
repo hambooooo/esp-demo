@@ -13,7 +13,7 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::{Level, NoPin, Output, OutputConfig};
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::timer::systimer::SystemTimer;
@@ -27,11 +27,11 @@ use embedded_graphics::{
     prelude::*,
     primitives::{Circle, Primitive, PrimitiveStyle, Triangle},
 };
-
+use esp_hal::time::Rate;
 // Provides the parallel port and display interface builders
 use mipidsi::interface::SpiInterface;
 
-use mipidsi::options::ColorOrder;
+use mipidsi::options::{ColorInversion, ColorOrder, Orientation};
 // Provides the Display builder
 use mipidsi::{models::ST7789, Builder};
 
@@ -74,19 +74,21 @@ async fn main(spawner: Spawner) {
     let mut delay = Delay::new();
 
     // Define the Data/Command select pin as a digital output
-    let dc = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+    let dc = Output::new(peripherals.GPIO3, Level::Low, OutputConfig::default());
     // Define the reset pin as digital outputs and make it high
-    let mut rst = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
+    let mut rst = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
     rst.set_high();
 
     // Define the SPI pins and create the SPI interface
-    let spi = Spi::new(peripherals.SPI2, Config::default())
+    let spi = Spi::new(peripherals.SPI2, Config::default()
+        .with_frequency(Rate::from_mhz(40))
+        .with_mode(esp_hal::spi::Mode::_3)
+    )
         .unwrap()
-        .with_sck(peripherals.GPIO0)
-        .with_mosi(peripherals.GPIO1)
-        .with_miso(peripherals.GPIO2);
+        .with_sck(peripherals.GPIO1)
+        .with_mosi(peripherals.GPIO2);
 
-    let cs_output = Output::new(peripherals.GPIO3, Level::High, OutputConfig::default());
+    let cs_output = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
     let spi_device = ExclusiveDevice::new_no_delay(spi, cs_output).unwrap();
 
     let mut buffer = [0_u8; 512];
@@ -97,18 +99,19 @@ async fn main(spawner: Spawner) {
     // Define the display from the display interface and initialize it
     let mut display = Builder::new(ST7789, di)
         .reset_pin(rst)
+        // .invert_colors(ColorInversion::Inverted)
         .init(&mut delay)
         .unwrap();
 
     // Make the display all black
-    display.clear(Rgb565::BLACK).unwrap();
+    display.clear(Rgb565::RED).unwrap();
 
     // Draw a smiley face with white eyes and a red mouth
     draw_smiley(&mut display).unwrap();
 
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        // info!("Hello world!");
+        // Timer::after(Duration::from_secs(1)).await;
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-rc.0/examples/src/bin
