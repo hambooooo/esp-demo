@@ -27,6 +27,9 @@ use embedded_graphics::{
     prelude::*,
     primitives::{Circle, Primitive, PrimitiveStyle, Triangle},
 };
+use esp_hal::mcpwm::{McPwm, PeripheralClockConfig};
+use esp_hal::mcpwm::operator::PwmPinConfig;
+use esp_hal::mcpwm::timer::PwmWorkingMode;
 use esp_hal::time::Rate;
 // Provides the parallel port and display interface builders
 use mipidsi::interface::SpiInterface;
@@ -108,6 +111,15 @@ async fn main(spawner: Spawner) {
 
     // Draw a smiley face with white eyes and a red mouth
     draw_smiley(&mut display).unwrap();
+
+    let clock_cfg = PeripheralClockConfig::with_frequency(Rate::from_mhz(40)).unwrap();
+    let timer_clock_cfg = clock_cfg.timer_clock_with_frequency(99, PwmWorkingMode::Increase, Rate::from_khz(20)).unwrap();
+    let mut mcpwm = McPwm::new(peripherals.MCPWM0, clock_cfg);
+    mcpwm.timer0.start(timer_clock_cfg);
+    let mut bl_pwm = mcpwm
+        .operator0
+        .with_pin_a(peripherals.GPIO5, PwmPinConfig::UP_ACTIVE_HIGH);
+    bl_pwm.set_timestamp(50);
 
     loop {
         // info!("Hello world!");
