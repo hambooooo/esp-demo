@@ -102,12 +102,12 @@ async fn main(spawner: Spawner) {
     // Define the display from the display interface and initialize it
     let mut display = Builder::new(ST7789, di)
         .reset_pin(rst)
-        // .invert_colors(ColorInversion::Inverted)
+        .invert_colors(ColorInversion::Inverted)
         .init(&mut delay)
         .unwrap();
 
     // Make the display all black
-    display.clear(Rgb565::RED).unwrap();
+    display.clear(Rgb565::BLACK).unwrap();
 
     // Draw a smiley face with white eyes and a red mouth
     draw_smiley(&mut display).unwrap();
@@ -119,7 +119,7 @@ async fn main(spawner: Spawner) {
     let mut bl_pwm = mcpwm
         .operator0
         .with_pin_a(peripherals.GPIO5, PwmPinConfig::UP_ACTIVE_HIGH);
-    bl_pwm.set_timestamp(50);
+    bl_pwm.set_timestamp(80);
 
     loop {
         // info!("Hello world!");
